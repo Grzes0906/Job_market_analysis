@@ -1,19 +1,22 @@
 """
 src/main.py
 -----------
-Core backend module for the Global Remote IT Job Market Analysis project.
+Core backend module for the Polish IT Job Market Analysis project.
 
-Aggregates remote IT job postings from the RemoteOK public API across a
-curated list of technology tags (e.g. "python", "aws", "react") to build a
-statistically significant dataset.  Each tag is queried individually via
-``/api?tags=<tag>``, results are merged into one collection, and exact
-duplicates (jobs that matched multiple tags) are removed before the DataFrame
-is returned.  A configurable polite delay between requests prevents
-rate-limiting.
+Aggregates Polish IT job postings from the Adzuna Jobs API across a curated
+list of technology search terms (e.g. "Python", "Java", "Data") to build a
+statistically significant dataset.  Each term is queried individually against
+the Polish market endpoint (``/jobs/pl/search/1``), results are merged and
+deduplicated on ``(company, position)`` to eliminate cross-term overlaps.
+
+Credentials are read securely from environment variables via ``python-dotenv``
+(``ADZUNA_APP_ID`` and ``ADZUNA_APP_KEY``).  Salary thresholds are calibrated
+for annual PLN figures.
 
 Pipeline
 --------
-1. ``fetch_remote_jobs()``           – multi-tag ingestion → deduplicated DataFrame
+0. ``_load_credentials()``           – dotenv → (app_id, app_key) or ValueError
+1. ``fetch_remote_jobs()``           – multi-term ingestion → deduplicated DataFrame
 2. ``clean_and_analyze_salaries()``  – salary cleaning, outlier removal, avg column
 
 Usage (standalone smoke-test):
@@ -23,6 +26,7 @@ Usage (standalone smoke-test):
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import time
 from typing import Any
@@ -30,6 +34,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
 # Module-level configuration
@@ -42,40 +47,83 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# RemoteOK rejects requests without a meaningful User-Agent (HTTP 403).
-_REQUEST_HEADERS: dict[str, str] = {
-    "User-Agent": (
-        "RemoteJobsResearch/1.0 "
-        "(Academic data-analysis project; "
-        "github.com/your-org/remote-jobs-analysis)"
-    )
-}
+# Adzuna Polish-market search endpoint (page 1; we collect all terms in one
+# pass rather than paginating, which keeps the crawl lightweight for the
+# academic use-case).
+ADZUNA_BASE_URL: str = "https://api.adzuna.com/v1/api/jobs/pl/search/1"
 
-# Public RemoteOK API base endpoint (no auth required).
-REMOTEOK_API_URL: str = "https://remoteok.com/api"
-
-# Technology tags used to query the API individually.
-# Each tag maps to  GET /api?tags=<tag>.  Broaden or narrow this list to
-# control dataset size vs. crawl time.
-TECH_TAGS: list[str] = [
-    "python",
-    "javascript",
-    "data",
-    "aws",
-    "react",
-    "node",
-    "devops",
-    "go",
-    "sql",
-    "machine-learning",
+# Technology search terms used to query the API individually.
+# Each term maps to GET /jobs/pl/search/1?what=<term>&results_per_page=50.
+# Broaden or narrow this list to control dataset size vs. crawl time.
+SEARCH_TERMS: list[str] = [
+    "Python",
+    "Java",
+    "JavaScript",
+    "Data",
+    "DevOps",
+    "React",
+    "SQL",
+    "Machine Learning",
+    "AWS",
+    "Go",
 ]
 
-# Polite delay (seconds) between consecutive tag requests to avoid 429s.
-REQUEST_DELAY_SECONDS: float = 2.0
+# Adzuna's documented maximum is 50 results per page.
+RESULTS_PER_PAGE: int = 50
 
-# Salary boundaries used for outlier removal (USD, annual).
-SALARY_MIN_THRESHOLD: float = 1_000.0      # Below this → fake / placeholder
-SALARY_MAX_THRESHOLD: float = 5_000_000.0  # Above this → clearly erroneous
+# Polite delay (seconds) between consecutive term requests to avoid 429s.
+REQUEST_DELAY_SECONDS: float = 1.0
+
+# Salary outlier thresholds calibrated for annual gross PLN figures.
+#   30 000 PLN/yr  ≈ minimum wage territory (filters placeholders / test data)
+#   1 000 000 PLN/yr ≈ hard ceiling for realistic IT compensation in Poland
+SALARY_MIN_THRESHOLD: float = 30_000.0
+SALARY_MAX_THRESHOLD: float = 1_000_000.0
+
+
+# ---------------------------------------------------------------------------
+# 0. Credential management
+# ---------------------------------------------------------------------------
+
+def _load_credentials() -> tuple[str, str]:
+    """Load Adzuna API credentials from the environment via python-dotenv.
+
+    Reads the ``.env`` file in the current working directory (if present) and
+    exposes its contents as environment variables before attempting to read
+    ``ADZUNA_APP_ID`` and ``ADZUNA_APP_KEY``.
+
+    Returns
+    -------
+    tuple[str, str]
+        A ``(app_id, app_key)`` pair, both guaranteed to be non-empty strings.
+
+    Raises
+    ------
+    ValueError
+        If either variable is absent or empty.
+    """
+    load_dotenv()
+
+    app_id = os.getenv("ADZUNA_APP_ID")
+    app_key = os.getenv("ADZUNA_APP_KEY")
+
+    if not app_id or not app_key:
+        missing = []
+        if not app_id:
+            missing.append("ADZUNA_APP_ID")
+        if not app_key:
+            missing.append("ADZUNA_APP_KEY")
+
+        raise ValueError(
+            f"Missing required environment variable(s): {', '.join(missing)}.\n"
+            "Create a .env file in the project root with the following content:\n\n"
+            "    ADZUNA_APP_ID=your_app_id_here\n"
+            "    ADZUNA_APP_KEY=your_app_key_here\n\n"
+            "Obtain credentials at https://developer.adzuna.com/"
+        )
+
+    # PyCharm is now 100% sure these are strings, no 'ignore' needed
+    return app_id, app_key
 
 
 # ---------------------------------------------------------------------------
@@ -83,17 +131,18 @@ SALARY_MAX_THRESHOLD: float = 5_000_000.0  # Above this → clearly erroneous
 # ---------------------------------------------------------------------------
 
 def fetch_remote_jobs() -> pd.DataFrame:
-    """Aggregate remote IT job postings across multiple technology tags.
+    """Aggregate Polish IT job postings across multiple technology search terms.
 
-    Iterates over :data:`TECH_TAGS`, issuing one GET request per tag to
-    ``/api?tags=<tag>``.  A :data:`REQUEST_DELAY_SECONDS` sleep is inserted
-    between requests to respect the server's rate limits.  Tags that return
-    HTTP errors or malformed payloads are skipped with a warning so a single
-    failed tag cannot abort the entire crawl.
+    Loads Adzuna credentials via :func:`_load_credentials`, then iterates over
+    :data:`SEARCH_TERMS`, issuing one GET request per term to the Adzuna Polish
+    market endpoint.  A :data:`REQUEST_DELAY_SECONDS` sleep is inserted between
+    requests to respect rate limits.  Terms that return HTTP errors or malformed
+    payloads are skipped with a warning so a single failed term cannot abort the
+    entire crawl.
 
-    After all tags have been queried, the collected records are merged into
-    one list and deduplicated on ``(company, position)`` to eliminate jobs
-    that appeared under multiple tags.
+    After all terms have been queried, collected records are merged and
+    deduplicated on ``(company, position)`` to eliminate jobs that matched
+    multiple search terms.
 
     Returns
     -------
@@ -101,34 +150,36 @@ def fetch_remote_jobs() -> pd.DataFrame:
         Raw (uncleaned) DataFrame with one row per unique job posting and the
         following columns:
 
-        * ``company``    – Hiring company name.
+        * ``company``    – Hiring company display name.
         * ``position``   – Job title / role.
-        * ``tags``       – Comma-separated technology / skill tags.
-        * ``location``   – Advertised location string (often "Worldwide").
-        * ``salary_min`` – Lower bound of advertised salary range (float).
-        * ``salary_max`` – Upper bound of advertised salary range (float).
+        * ``location``   – City or region display name.
+        * ``salary_min`` – Lower bound of advertised salary range (float, PLN).
+        * ``salary_max`` – Upper bound of advertised salary range (float, PLN).
 
     Raises
     ------
     ValueError
-        If no records were collected across *all* tag queries (total failure).
+        If credentials are missing (propagated from :func:`_load_credentials`)
+        or if no records were collected across all term queries (total failure).
     """
+    app_id, app_key = _load_credentials()
+
     all_records: list[dict[str, Any]] = []
 
-    for index, tag in enumerate(TECH_TAGS):
-        tag_records = _fetch_tag_jobs(tag)
-        all_records.extend(tag_records)
+    for index, term in enumerate(SEARCH_TERMS):
+        term_records = _fetch_term_jobs(term, app_id, app_key)
+        all_records.extend(term_records)
         logger.info(
-            "Tag '%s' (%d/%d): %d postings collected — running total: %d.",
-            tag,
+            "Term '%s' (%d/%d): %d postings collected — running total: %d.",
+            term,
             index + 1,
-            len(TECH_TAGS),
-            len(tag_records),
+            len(SEARCH_TERMS),
+            len(term_records),
             len(all_records),
         )
 
-        # Pause between requests — skip the delay after the final tag.
-        if index < len(TECH_TAGS) - 1:
+        # Pause between requests — skip the delay after the final term.
+        if index < len(SEARCH_TERMS) - 1:
             logger.debug(
                 "Sleeping %.1fs before next request.", REQUEST_DELAY_SECONDS
             )
@@ -136,8 +187,10 @@ def fetch_remote_jobs() -> pd.DataFrame:
 
     if not all_records:
         raise ValueError(
-            "No job records were collected across all tag queries. "
-            "Check network connectivity and RemoteOK API availability."
+            "No job records were collected across all search term queries.\n"
+            "Possible causes: network outage, invalid credentials, or the "
+            "Adzuna API returned no results for any of the configured terms.\n"
+            f"Configured terms: {SEARCH_TERMS}"
         )
 
     df = pd.DataFrame(all_records)
@@ -146,7 +199,7 @@ def fetch_remote_jobs() -> pd.DataFrame:
     df["salary_min"] = pd.to_numeric(df["salary_min"], errors="coerce")
     df["salary_max"] = pd.to_numeric(df["salary_max"], errors="coerce")
 
-    # Remove jobs that matched multiple tags — keep first occurrence.
+    # Remove jobs that matched multiple search terms — keep first occurrence.
     pre_dedup_count: int = len(df)
     df = (
         df
@@ -171,81 +224,125 @@ def fetch_remote_jobs() -> pd.DataFrame:
 # 1a. Private ingestion helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_tag_jobs(tag: str) -> list[dict[str, Any]]:
-    """Fetch and parse job postings for a single RemoteOK tag.
+def _fetch_term_jobs(
+    term: str,
+    app_id: str,
+    app_key: str,
+) -> list[dict[str, Any]]:
+    """Fetch and parse job postings for a single Adzuna search term.
 
-    Performs one HTTP GET to ``/api?tags=<tag>`` and delegates JSON parsing
-    to :func:`_parse_job_entries`.  Any network or HTTP error is caught,
-    logged as a warning, and an empty list is returned — allowing the caller
-    to continue with remaining tags.
+    Performs one authenticated HTTP GET to the Adzuna Polish market endpoint
+    with the provided search term and delegates JSON normalisation to
+    :func:`_parse_job_entries`.  Any network or HTTP error is caught, logged
+    as a warning, and an empty list is returned — allowing the caller to
+    continue with remaining terms.
 
     Parameters
     ----------
-    tag : str
-        Technology tag to query (e.g. ``"python"``, ``"devops"``).
+    term : str
+        Free-text technology search term (e.g. ``"Python"``, ``"DevOps"``).
+        Passed as the ``what`` query parameter.
+    app_id : str
+        Adzuna application ID (from ``ADZUNA_APP_ID`` env var).
+    app_key : str
+        Adzuna application key (from ``ADZUNA_APP_KEY`` env var).
 
     Returns
     -------
     list[dict[str, Any]]
-        Parsed job records for this tag, or an empty list on failure.
+        Parsed and normalised job records for this term, or an empty list on
+        any failure.
     """
-    url = f"{REMOTEOK_API_URL}?tags={tag}"
-    logger.info("GET %s", url)
+    params: dict[str, Any] = {
+        "app_id": app_id,
+        "app_key": app_key,
+        "what": term,
+        "results_per_page": RESULTS_PER_PAGE,
+        "content-type": "application/json",
+    }
+
+    logger.info("GET %s  [what=%s]", ADZUNA_BASE_URL, term)
 
     try:
-        response = requests.get(url, headers=_REQUEST_HEADERS, timeout=30)
+        response = requests.get(
+            ADZUNA_BASE_URL,
+            params=params,
+            timeout=30,
+        )
         response.raise_for_status()
     except requests.HTTPError as exc:
         logger.warning(
-            "HTTP error for tag '%s' (%s) — skipping tag.", tag, exc
+            "HTTP error for term '%s' (%s) — skipping term.", term, exc
         )
         return []
     except requests.RequestException as exc:
         logger.warning(
-            "Network error for tag '%s' (%s) — skipping tag.", tag, exc
+            "Network error for term '%s' (%s) — skipping term.", term, exc
         )
         return []
 
-    raw: Any = response.json()
+    payload: Any = response.json()
 
-    if not isinstance(raw, list) or len(raw) == 0:
+    # Adzuna wraps results in a top-level dict: {"results": [...], "count": N}
+    if not isinstance(payload, dict) or "results" not in payload:
         logger.warning(
-            "Unexpected response format for tag '%s' "
-            "(got %s, expected non-empty list) — skipping tag.",
-            tag,
-            type(raw).__name__,
+            "Unexpected response format for term '%s' "
+            "(expected dict with 'results' key, got %s) — skipping term.",
+            term,
+            type(payload).__name__,
         )
         return []
 
-    # The first element is a metadata / legal notice dict (not a job).
-    # Guard: only skip it when it truly lacks the 'company' field so the
-    # logic stays correct if RemoteOK ever normalises this behaviour.
-    job_entries: list[dict[str, Any]] = (
-        raw[1:] if "company" not in raw[0] else raw
-    )
+    raw_results: Any = payload["results"]
 
-    return _parse_job_entries(job_entries)
+    if not isinstance(raw_results, list):
+        logger.warning(
+            "Field 'results' for term '%s' is not a list (got %s) "
+            "— skipping term.",
+            term,
+            type(raw_results).__name__,
+        )
+        return []
+
+    logger.debug("Term '%s': API returned %d raw result(s).", term, len(raw_results))
+    return _parse_job_entries(raw_results)
 
 
 def _parse_job_entries(
     entries: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Normalise a list of raw job-posting dicts into flat record dicts.
+    """Normalise a list of raw Adzuna job-posting dicts into flat record dicts.
 
-    Extracts the six target fields from each entry, coerces salary values to
-    float via :func:`_to_float`, and joins the ``tags`` list into a single
-    comma-separated string.  Non-dict items are silently skipped.
+    Extracts the five target fields from each entry.  Nested objects
+    (``company``, ``location``) are safely traversed with chained ``.get()``
+    calls so that a missing sub-key never raises a ``KeyError``.  Salary
+    values are coerced to float via :func:`_to_float`.  Non-dict items are
+    silently skipped.
 
     Parameters
     ----------
     entries : list[dict[str, Any]]
-        Raw job-posting dicts as returned by the RemoteOK API (metadata
-        element already removed).
+        Raw job-posting dicts as returned under the ``"results"`` key of an
+        Adzuna API response.
 
     Returns
     -------
     list[dict[str, Any]]
         List of flat record dicts ready for ``pd.DataFrame(records)``.
+
+    Notes
+    -----
+    Adzuna nested field mapping:
+
+    +--------------------------+------------------+
+    | API path                 | DataFrame column |
+    +==========================+==================+
+    | ``company.display_name`` | ``company``      |
+    | ``title``                | ``position``     |
+    | ``location.display_name``| ``location``     |
+    | ``salary_min``           | ``salary_min``   |
+    | ``salary_max``           | ``salary_max``   |
+    +--------------------------+------------------+
     """
     records: list[dict[str, Any]] = []
 
@@ -253,18 +350,20 @@ def _parse_job_entries(
         if not isinstance(entry, dict):
             continue  # Skip unexpected non-dict items defensively.
 
-        # Tags arrive as a list; join to a comma-separated string for storage.
-        raw_tags: list[str] | None = entry.get("tags")
-        tags_str: str = (
-            ", ".join(raw_tags) if isinstance(raw_tags, list) else ""
-        )
+        # Safely navigate nested objects; default to empty string if absent.
+        company: str = (
+            entry.get("company") or {}
+        ).get("display_name", "")
+
+        location: str = (
+            entry.get("location") or {}
+        ).get("display_name", "")
 
         records.append(
             {
-                "company": entry.get("company", ""),
-                "position": entry.get("position", ""),
-                "tags": tags_str,
-                "location": entry.get("location", ""),
+                "company": company,
+                "position": entry.get("title", ""),
+                "location": location,
                 "salary_min": _to_float(entry.get("salary_min")),
                 "salary_max": _to_float(entry.get("salary_max")),
             }
@@ -289,7 +388,7 @@ def clean_and_analyze_salaries(df: pd.DataFrame) -> pd.DataFrame:
        ``salary_max`` using NumPy/Pandas vectorised operations.  When only one
        bound is present the available value is used as the estimate.
     3. **Remove outliers** – discard rows whose ``salary_avg`` falls outside
-       the plausible annual USD range
+       the plausible annual PLN range
        [``SALARY_MIN_THRESHOLD``, ``SALARY_MAX_THRESHOLD``].
 
     Parameters
@@ -302,7 +401,7 @@ def clean_and_analyze_salaries(df: pd.DataFrame) -> pd.DataFrame:
     pd.DataFrame
         Cleaned DataFrame with the additional ``salary_avg`` column,
         reset integer index, and all salary values guaranteed to be
-        finite floats within the plausible range.
+        finite floats within the plausible PLN range.
 
     Raises
     ------
@@ -398,23 +497,34 @@ def _to_float(value: Any) -> float | None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    print("=" * 60)
-    print("  Remote IT Job Market — Backend Smoke Test")
-    print(f"  Querying {len(TECH_TAGS)} tags: {', '.join(TECH_TAGS)}")
-    print("=" * 60)
+    """Run an end-to-end smoke test: fetch → clean → describe.
+
+    Intended for direct script execution only (``python src/main.py``).
+    Exits with code 1 on any unrecoverable error so the failure is visible
+    in CI pipelines and shell scripts.
+    """
+    print("=" * 62)
+    print("  Polish IT Job Market — Adzuna Backend Smoke Test")
+    print(f"  Querying {len(SEARCH_TERMS)} terms: {', '.join(SEARCH_TERMS)}")
+    print("=" * 62)
 
     # -- Fetch --
     try:
         raw_df = fetch_remote_jobs()
     except ValueError as exc:
-        logger.error("Fatal fetch error: %s", exc)
+        logger.error("Fatal fetch error:\n%s", exc)
         sys.exit(1)
 
     print(f"\n[1] Raw aggregated fetch — shape: {raw_df.shape}")
-    print(raw_df[["company", "position", "tags", "salary_min",
-                   "salary_max"]].head(5).to_string(index=False))
+    print(
+        raw_df[["company", "position", "location", "salary_min", "salary_max"]]
+        .head(5)
+        .to_string(index=False)
+    )
 
-    salary_coverage = raw_df[["salary_min", "salary_max"]].notna().any(axis=1)
+    salary_coverage: pd.Series = (
+        raw_df[["salary_min", "salary_max"]].notna().any(axis=1)
+    )
     print(
         f"\n    Jobs with salary data: "
         f"{salary_coverage.sum()} / {len(raw_df)} "
@@ -429,12 +539,15 @@ def main() -> None:
         sys.exit(1)
 
     print(f"\n[2] After cleaning — shape: {clean_df.shape}")
-    print(clean_df[["company", "position", "salary_min",
-                     "salary_max", "salary_avg"]].head(5).to_string(index=False))
+    print(
+        clean_df[["company", "position", "salary_min", "salary_max", "salary_avg"]]
+        .head(5)
+        .to_string(index=False)
+    )
 
     # -- Descriptive statistics --
-    salary_cols = ["salary_min", "salary_max", "salary_avg"]
-    print(f"\n[3] Salary descriptive statistics (n={len(clean_df)}):")
+    salary_cols: list[str] = ["salary_min", "salary_max", "salary_avg"]
+    print(f"\n[3] Salary descriptive statistics  [PLN, annual]  (n={len(clean_df)}):")
     print(clean_df[salary_cols].describe().round(2).to_string())
     print("\nDone. ✓")
 

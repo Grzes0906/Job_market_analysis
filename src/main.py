@@ -3,10 +3,18 @@ src/main.py
 -----------
 Core backend module for the Global Remote IT Job Market Analysis project.
 
-Fetches live job postings from the RemoteOK public API, normalises the raw
-JSON payload into a tidy Pandas DataFrame, and applies salary-focused
-cleaning / outlier removal so the data is ready for downstream plotting or
-statistical analysis.
+Aggregates remote IT job postings from the RemoteOK public API across a
+curated list of technology tags (e.g. "python", "aws", "react") to build a
+statistically significant dataset.  Each tag is queried individually via
+``/api?tags=<tag>``, results are merged into one collection, and exact
+duplicates (jobs that matched multiple tags) are removed before the DataFrame
+is returned.  A configurable polite delay between requests prevents
+rate-limiting.
+
+Pipeline
+--------
+1. ``fetch_remote_jobs()``           – multi-tag ingestion → deduplicated DataFrame
+2. ``clean_and_analyze_salaries()``  – salary cleaning, outlier removal, avg column
 
 Usage (standalone smoke-test):
     python src/main.py
@@ -16,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from typing import Any
 
 import numpy as np
@@ -42,8 +51,27 @@ _REQUEST_HEADERS: dict[str, str] = {
     )
 }
 
-# Public RemoteOK API endpoint (no auth required).
+# Public RemoteOK API base endpoint (no auth required).
 REMOTEOK_API_URL: str = "https://remoteok.com/api"
+
+# Technology tags used to query the API individually.
+# Each tag maps to  GET /api?tags=<tag>.  Broaden or narrow this list to
+# control dataset size vs. crawl time.
+TECH_TAGS: list[str] = [
+    "python",
+    "javascript",
+    "data",
+    "aws",
+    "react",
+    "node",
+    "devops",
+    "go",
+    "sql",
+    "machine-learning",
+]
+
+# Polite delay (seconds) between consecutive tag requests to avoid 429s.
+REQUEST_DELAY_SECONDS: float = 2.0
 
 # Salary boundaries used for outlier removal (USD, annual).
 SALARY_MIN_THRESHOLD: float = 1_000.0      # Below this → fake / placeholder
@@ -55,16 +83,22 @@ SALARY_MAX_THRESHOLD: float = 5_000_000.0  # Above this → clearly erroneous
 # ---------------------------------------------------------------------------
 
 def fetch_remote_jobs() -> pd.DataFrame:
-    """Fetch current remote IT job postings from the RemoteOK public API.
+    """Aggregate remote IT job postings across multiple technology tags.
 
-    The API returns a JSON array whose **first element is always a metadata /
-    legal notice object** rather than a real job posting.  That element is
-    detected and stripped before the DataFrame is constructed.
+    Iterates over :data:`TECH_TAGS`, issuing one GET request per tag to
+    ``/api?tags=<tag>``.  A :data:`REQUEST_DELAY_SECONDS` sleep is inserted
+    between requests to respect the server's rate limits.  Tags that return
+    HTTP errors or malformed payloads are skipped with a warning so a single
+    failed tag cannot abort the entire crawl.
+
+    After all tags have been queried, the collected records are merged into
+    one list and deduplicated on ``(company, position)`` to eliminate jobs
+    that appeared under multiple tags.
 
     Returns
     -------
     pd.DataFrame
-        Raw (uncleaned) DataFrame with one row per job posting and the
+        Raw (uncleaned) DataFrame with one row per unique job posting and the
         following columns:
 
         * ``company``    – Hiring company name.
@@ -76,47 +110,150 @@ def fetch_remote_jobs() -> pd.DataFrame:
 
     Raises
     ------
-    requests.HTTPError
-        If the RemoteOK server returns a non-2xx HTTP status code.
-    requests.ConnectionError
-        If the network request cannot be completed.
     ValueError
-        If the API response is not a non-empty JSON list.
+        If no records were collected across *all* tag queries (total failure).
     """
-    logger.info("Sending GET request to %s", REMOTEOK_API_URL)
+    all_records: list[dict[str, Any]] = []
 
-    response = requests.get(
-        REMOTEOK_API_URL,
-        headers=_REQUEST_HEADERS,
-        timeout=30,
+    for index, tag in enumerate(TECH_TAGS):
+        tag_records = _fetch_tag_jobs(tag)
+        all_records.extend(tag_records)
+        logger.info(
+            "Tag '%s' (%d/%d): %d postings collected — running total: %d.",
+            tag,
+            index + 1,
+            len(TECH_TAGS),
+            len(tag_records),
+            len(all_records),
+        )
+
+        # Pause between requests — skip the delay after the final tag.
+        if index < len(TECH_TAGS) - 1:
+            logger.debug(
+                "Sleeping %.1fs before next request.", REQUEST_DELAY_SECONDS
+            )
+            time.sleep(REQUEST_DELAY_SECONDS)
+
+    if not all_records:
+        raise ValueError(
+            "No job records were collected across all tag queries. "
+            "Check network connectivity and RemoteOK API availability."
+        )
+
+    df = pd.DataFrame(all_records)
+
+    # Ensure salary columns are always numeric even when all values are NaN.
+    df["salary_min"] = pd.to_numeric(df["salary_min"], errors="coerce")
+    df["salary_max"] = pd.to_numeric(df["salary_max"], errors="coerce")
+
+    # Remove jobs that matched multiple tags — keep first occurrence.
+    pre_dedup_count: int = len(df)
+    df = (
+        df
+        .drop_duplicates(subset=["company", "position"])
+        .reset_index(drop=True)
+    )
+    logger.info(
+        "Deduplication on (company, position): %d → %d rows "
+        "(removed %d duplicates).",
+        pre_dedup_count,
+        len(df),
+        pre_dedup_count - len(df),
     )
 
-    # Surface HTTP errors (403, 429, 5xx, …) as Python exceptions.
-    response.raise_for_status()
+    logger.info(
+        "Final raw DataFrame: %d rows × %d columns.", df.shape[0], df.shape[1]
+    )
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 1a. Private ingestion helpers
+# ---------------------------------------------------------------------------
+
+def _fetch_tag_jobs(tag: str) -> list[dict[str, Any]]:
+    """Fetch and parse job postings for a single RemoteOK tag.
+
+    Performs one HTTP GET to ``/api?tags=<tag>`` and delegates JSON parsing
+    to :func:`_parse_job_entries`.  Any network or HTTP error is caught,
+    logged as a warning, and an empty list is returned — allowing the caller
+    to continue with remaining tags.
+
+    Parameters
+    ----------
+    tag : str
+        Technology tag to query (e.g. ``"python"``, ``"devops"``).
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        Parsed job records for this tag, or an empty list on failure.
+    """
+    url = f"{REMOTEOK_API_URL}?tags={tag}"
+    logger.info("GET %s", url)
+
+    try:
+        response = requests.get(url, headers=_REQUEST_HEADERS, timeout=30)
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        logger.warning(
+            "HTTP error for tag '%s' (%s) — skipping tag.", tag, exc
+        )
+        return []
+    except requests.RequestException as exc:
+        logger.warning(
+            "Network error for tag '%s' (%s) — skipping tag.", tag, exc
+        )
+        return []
 
     raw: Any = response.json()
 
     if not isinstance(raw, list) or len(raw) == 0:
-        raise ValueError(
-            f"Unexpected API response format – expected a non-empty list, "
-            f"got {type(raw).__name__}."
+        logger.warning(
+            "Unexpected response format for tag '%s' "
+            "(got %s, expected non-empty list) — skipping tag.",
+            tag,
+            type(raw).__name__,
         )
+        return []
 
     # The first element is a metadata / legal notice dict (not a job).
-    # Guard: only skip it when it truly lacks a typical job field such as
-    # 'company', so the code remains correct if RemoteOK ever fixes this.
+    # Guard: only skip it when it truly lacks the 'company' field so the
+    # logic stays correct if RemoteOK ever normalises this behaviour.
     job_entries: list[dict[str, Any]] = (
         raw[1:] if "company" not in raw[0] else raw
     )
 
-    logger.info("Received %d job postings from API.", len(job_entries))
+    return _parse_job_entries(job_entries)
 
+
+def _parse_job_entries(
+    entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Normalise a list of raw job-posting dicts into flat record dicts.
+
+    Extracts the six target fields from each entry, coerces salary values to
+    float via :func:`_to_float`, and joins the ``tags`` list into a single
+    comma-separated string.  Non-dict items are silently skipped.
+
+    Parameters
+    ----------
+    entries : list[dict[str, Any]]
+        Raw job-posting dicts as returned by the RemoteOK API (metadata
+        element already removed).
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        List of flat record dicts ready for ``pd.DataFrame(records)``.
+    """
     records: list[dict[str, Any]] = []
-    for entry in job_entries:
-        if not isinstance(entry, dict):
-            continue  # Skip any unexpected non-dict items defensively.
 
-        # Tags arrive as a list; join into a single comma-separated string.
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue  # Skip unexpected non-dict items defensively.
+
+        # Tags arrive as a list; join to a comma-separated string for storage.
         raw_tags: list[str] | None = entry.get("tags")
         tags_str: str = (
             ", ".join(raw_tags) if isinstance(raw_tags, list) else ""
@@ -133,16 +270,7 @@ def fetch_remote_jobs() -> pd.DataFrame:
             }
         )
 
-    df = pd.DataFrame(records)
-
-    # Ensure salary columns are always numeric even when all values are NaN.
-    df["salary_min"] = pd.to_numeric(df["salary_min"], errors="coerce")
-    df["salary_max"] = pd.to_numeric(df["salary_max"], errors="coerce")
-
-    logger.info(
-        "DataFrame built: %d rows × %d columns.", df.shape[0], df.shape[1]
-    )
-    return df
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +378,7 @@ def _to_float(value: Any) -> float | None:
     Parameters
     ----------
     value : Any
-        Raw value from the JSON payload (may take values of str, int, float, None, …).
+        Raw value from the JSON payload (may be str, int, float, None, …).
 
     Returns
     -------
@@ -269,26 +397,29 @@ def _to_float(value: Any) -> float | None:
 # 4. Smoke-test entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def main() -> None:
     print("=" * 60)
     print("  Remote IT Job Market — Backend Smoke Test")
+    print(f"  Querying {len(TECH_TAGS)} tags: {', '.join(TECH_TAGS)}")
     print("=" * 60)
 
     # -- Fetch --
     try:
         raw_df = fetch_remote_jobs()
-    except requests.HTTPError as exc:
-        logger.error("HTTP error while fetching jobs: %s", exc)
-        sys.exit(1)
-    except requests.ConnectionError as exc:
-        logger.error("Network error – check your internet connection: %s", exc)
-        sys.exit(1)
     except ValueError as exc:
-        logger.error("Unexpected API response: %s", exc)
+        logger.error("Fatal fetch error: %s", exc)
         sys.exit(1)
 
-    print(f"\n[1] Raw fetch — shape: {raw_df.shape}")
-    print(raw_df.head(3).to_string(index=False))
+    print(f"\n[1] Raw aggregated fetch — shape: {raw_df.shape}")
+    print(raw_df[["company", "position", "tags", "salary_min",
+                   "salary_max"]].head(5).to_string(index=False))
+
+    salary_coverage = raw_df[["salary_min", "salary_max"]].notna().any(axis=1)
+    print(
+        f"\n    Jobs with salary data: "
+        f"{salary_coverage.sum()} / {len(raw_df)} "
+        f"({salary_coverage.mean():.1%})"
+    )
 
     # -- Clean & analyse --
     try:
@@ -306,3 +437,7 @@ if __name__ == "__main__":
     print(f"\n[3] Salary descriptive statistics (n={len(clean_df)}):")
     print(clean_df[salary_cols].describe().round(2).to_string())
     print("\nDone. ✓")
+
+
+if __name__ == "__main__":
+    main()
